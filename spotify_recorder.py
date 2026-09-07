@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Record the Pi's Spotify audio output; split/tag uninterrupted tracks afterward.
+"""Record the Pi's Spotify audio output; split/tag uninterrupted tracks in the background.
 
 Spotify Soloist supplies local metadata over WebSocket. FFmpeg captures a named
 PulseAudio/PipeWire monitor continuously. Optional Spotify Web API credentials
@@ -10,6 +10,8 @@ See README.md for setup, audio routing, and limitations.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
@@ -350,7 +352,7 @@ def record(args):
                    "-f", "pulse", "-sample_rate", "44100", "-channels", "2",
                    "-fragment_size", "4096", "-i", args.source,
                    "-map", "0:a:0", "-c:a", "flac", "-compression_level", "0",
-                   "-threads", "1", str(session / "session.flac")]
+                   "-threads", "1", "-flush_packets", "1", str(session / "session.flac")]
         sock = None
         catalog = load_json(root / "metadata.json", {})
         if not isinstance(catalog, dict):
@@ -361,6 +363,8 @@ def record(args):
             process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                                        stderr=capture_log, start_new_session=True)
             next_request, next_connect, backoff, saved_segments = 0.0, 0.0, 1.0, 0
+            worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="flac-export")
+            pending_export, submitted_segments = None, 0
             seen_playing, idle_since, paused_since = False, None, None
             last_persist = start
             LOG.info("Recording to %s. Start playlist playback now; Ctrl+C stops and exports.", session)
@@ -463,6 +467,28 @@ def record(args):
                             sock.close()
                         sock, next_connect = None, time.monotonic() + backoff
                         backoff = min(30, backoff * 2)
+                    # One in-flight batch, no unbounded queue. Copy metadata so the
+                    # capture thread never shares mutable state with the exporter.
+                    if pending_export is not None and pending_export.done():
+                        try:
+                            pending_export.result()
+                        except Exception:
+                            LOG.exception("Background export failed; will retry after capture stops")
+                        pending_export = None
+                    if not args.no_live_export and pending_export is None:
+                        ready = submitted_segments
+                        for segment in tracker.segments[submitted_segments:]:
+                            end = segment["start"] + segment["track"]["duration_ms"] / 1000
+                            if segment["complete"] and time.monotonic() - start < end + 5:
+                                break  # Allow capture buffers to reach the file.
+                            ready += 1
+                        batch = tracker.segments[submitted_segments:ready]
+                        if any(segment["complete"] for segment in batch):
+                            snapshot = deepcopy(dict(manifest, segments=batch))
+                            pending_export = worker.submit(
+                                export, session, lyrics_source=args.lyrics,
+                                live_manifest=snapshot)
+                        submitted_segments = ready
                     if len(tracker.segments) != saved_segments or time.monotonic() - last_persist >= 5:
                         catalog.update(tracker.catalog)
                         if catalog != load_json(root / "metadata.json", {}):
@@ -479,6 +505,8 @@ def record(args):
                 if sock:
                     sock.close()
                 status = stop_capture(process)
+                LOG.info("Waiting for any background export to finish")
+                worker.shutdown(wait=True)
                 manifest.update(segments=tracker.segments, capture_returncode=status, stopped_at=time.time())
                 save_json(session / "session.json", manifest)
                 catalog.update(tracker.catalog)
@@ -581,9 +609,9 @@ def valid_final(path, track):
         return False
 
 
-def export(session, offset_ms=0, replace=False, lyrics_source="lrclib"):
+def export(session, offset_ms=0, replace=False, lyrics_source="lrclib", live_manifest=None):
     session = Path(session).expanduser().resolve()
-    manifest = load_json(session / "session.json")
+    manifest = live_manifest if live_manifest is not None else load_json(session / "session.json")
     if not manifest or manifest.get("schema") != 1:
         raise RuntimeError("Missing or incompatible session.json")
     root = Path(manifest["output_root"])
@@ -592,9 +620,14 @@ def export(session, offset_ms=0, replace=False, lyrics_source="lrclib"):
     output.mkdir(parents=True, exist_ok=True)
     with locked(root / ".export.lock"), requests.Session() as http:
         spotify = SpotifyEnricher(http)
-        probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(audio_path)],
-                               capture_output=True, text=True, check=True, timeout=30)
-        recorded_duration = float(json.loads(probe.stdout)["format"]["duration"])
+        # An open FLAC has no finalized duration header. During live export,
+        # decode only the requested interval and validate its actual duration
+        # before publishing. Short/partial reads are retried on final export.
+        recorded_duration = float("inf")
+        if live_manifest is None:
+            probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(audio_path)],
+                                   capture_output=True, text=True, check=True, timeout=30)
+            recorded_duration = float(json.loads(probe.stdout)["format"]["duration"])
         counts = {"saved": 0, "skipped": 0, "incomplete": 0, "failed": 0}
         failures = []
         overrides = artwork_overrides(session / "events.jsonl")
@@ -619,11 +652,16 @@ def export(session, offset_ms=0, replace=False, lyrics_source="lrclib"):
             try:
                 cover = get_artwork(track, root, http)
                 lyrics = get_lyrics(track, http, lyrics_source)
+                # Open FLAC files lack the final seek metadata; decode forward
+                # to the interval instead of relying on input seeking.
+                seek_input = (["-i", str(audio_path), "-ss", f"{start:.6f}"]
+                              if live_manifest is not None else
+                              ["-ss", f"{start:.6f}", "-i", str(audio_path)])
                 command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
-                           "-threads", "1", "-ss", f"{start:.6f}", "-i", str(audio_path),
+                           "-threads", "1", *seek_input,
                            "-t", f"{duration:.6f}", "-map", "0:a:0", "-vn", "-map_metadata", "-1",
                            "-c:a", "flac", "-compression_level", "5", "-threads", "1", str(temporary)]
-                result = subprocess.run(command, capture_output=True, text=True, timeout=max(120, duration * 3))
+                result = subprocess.run(command, capture_output=True, text=True, timeout=max(120, duration * 3 + (start if live_manifest is not None else 0)))
                 if result.returncode:
                     raise RuntimeError(f"FFmpeg export failed: {result.stderr[-1000:]}")
                 tagged = FLAC(temporary)
@@ -679,9 +717,11 @@ def export(session, offset_ms=0, replace=False, lyrics_source="lrclib"):
                 LOG.error("Export failed for %s: %s", track["title"], exc)
             finally:
                 temporary.unlink(missing_ok=True)
-        save_json(session / "export-report.json", {"counts": counts, "failures": failures,
+        report_name = "live-export-report.json" if live_manifest is not None else "export-report.json"
+        save_json(session / report_name, {"counts": counts, "failures": failures,
                                                     "offset_ms": offset_ms, "lyrics_source": lyrics_source})
-        LOG.info("Export complete: %s; continuous recording retained", counts)
+        LOG.info("%s: %s; continuous recording retained",
+                 "Background export batch complete" if live_manifest is not None else "Export complete", counts)
         return 2 if counts["failed"] or counts["incomplete"] or not (counts["saved"] + counts["skipped"]) else 0
 
 
@@ -692,7 +732,9 @@ def stop_signal(signum, frame):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    capture = commands.add_parser("record", help="Capture continuously, then export on stop")
+    capture = commands.add_parser("record", help="Capture with background export and a final retry on stop")
+    capture.add_argument("--no-live-export", action="store_true",
+                         help="Export only after capture stops (background export is enabled by default)")
     capture.add_argument("--source", required=True, help="Explicit monitor source, e.g. spotify_capture.monitor")
     capture.add_argument("--output", type=Path, default=Path("recordings"))
     capture.add_argument("--websocket", default="ws://127.0.0.1:9090")
