@@ -229,9 +229,21 @@ python spotify_recorder.py record \
 
 Turn off Spotify **Crossfade**, **Automix**, **Repeat**, and **Autoplay** for clean individual files. Start songs at their beginning. Do not seek, pause for a long time, change speed, or move playback away from Pi Recorder. Crossfade mixes songs together and cannot be perfectly removed afterward.
 
+### Background export while recording
+
+Background export is enabled by default. Use the same recording command as before; no extra flag is needed. After a complete track ends, the recorder allows five seconds for audio buffers to reach the file, then a single background worker exports it while capture continues. Encoding and artwork/lyrics requests can add more delay.
+
+`Ready to export` means the track is eligible. `Saved ARTIST - TITLE` means its finished FLAC is available in `~/spotify-recordings/tracks/` and can be copied while the next song records. Files are checked for duration and metadata and only moved into place after validation. A partial read of the growing recording is not published; failed or pending tracks are retried when recording stops. Existing valid exports are skipped.
+
+The continuous session remains available for recovery. `live-export-report.json` describes the most recent background batch, not the whole session. The final `export-report.json` covers all segments; tracks already saved in the background appear as skipped in that final report.
+
+On long sessions, background export can take longer because the unfinished FLAC must be decoded from its beginning to reach the requested song. There is only one background batch at a time. If your Pi struggles with simultaneous capture and encoding, add `--no-live-export` to return to exporting only after recording stops.
+
+Do not run a separate manual export against the active session. Stop the recorder normally before using the `export` command.
+
 ### Stopping
 
-Press `Ctrl+C` in the recorder terminal. It stops capture, preserves the session, and attempts to export complete tracks. Soloist can remain running for another session.
+Press `Ctrl+C` in the recorder terminal. It stops capture, waits for the background worker, preserves the session, and exports or retries remaining complete tracks. Wait for `Export complete` before closing its terminal or shutting down the Pi. Soloist can remain running for another session.
 
 Stop after a fixed time:
 
@@ -255,7 +267,7 @@ python spotify_recorder.py record \
 
 ## 9. Understand the output
 
-The default output is `/home/pi/spotify-recordings`, also written as `~/spotify-recordings`:
+With the commands in this guide, the output is `/home/pi/spotify-recordings`, also written as `~/spotify-recordings`:
 
 ```text
 ~/spotify-recordings/
@@ -308,7 +320,7 @@ python spotify_recorder.py export \
   ~/spotify-recordings/sessions/20260906T193709Z-973a09b3
 ```
 
-Valid files already in `tracks/` are skipped. If splits start slightly late, adjust the offset and replace old files:
+Valid files already in `tracks/` are skipped. If splits start slightly early, adjust the offset and replace old files:
 
 ```bash
 python spotify_recorder.py export \
@@ -432,3 +444,19 @@ python -m py_compile spotify_recorder.py
 
 The Raspberry Pi audio path and Soloist pairing require a live Pi test. Successful track IDs are skipped on later exports unless `--replace` is supplied.
 
+
+## Updating an existing Pi installation
+
+The new behavior starts with the next recorder process. Replacing the file does not change a process already running. Let the current session finish and export first. If you run the recorder as a service, stop that service and wait for export to finish before updating it; the service name depends on your setup.
+
+After the recorder has stopped, run these commands on the Pi:
+
+```bash
+cd ~/spotify-recorder
+cp spotify_recorder.py spotify_recorder.py.bak
+curl -fL https://raw.githubusercontent.com/ajshaw0327-sketch/spotify-recorder/main/spotify_recorder.py -o spotify_recorder.py.new
+.venv/bin/python -m py_compile spotify_recorder.py.new
+mv spotify_recorder.py.new spotify_recorder.py
+```
+
+Run each command only if the previous command succeeds. No new Python dependencies are required. Restart the recorder with your usual command or service. Completed songs will now export in the background.
