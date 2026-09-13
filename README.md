@@ -1,5 +1,7 @@
 # Spotify Recorder for Raspberry Pi
 
+Current recorder version: **2.0.0** (chunked capture).
+
 This project records the Spotify audio that is playing **on a Raspberry Pi** and saves complete songs as tagged FLAC files. It is intended for a headless Pi: you control playback from the Spotify app, while the Pi runs the player and recorder over SSH.
 
 Use it only for audio you are allowed to record. This program records the Pi's audio output; it does not download songs from YouTube and it does not bypass Spotify's access controls.
@@ -11,11 +13,11 @@ There are four pieces:
 1. **Spotify app** — you choose music and choose the Pi as the playback device.
 2. **Spotify Soloist** — Spotify's official headless Linux player. It plays music on the Pi and reports the current track locally.
 3. **PipeWire/PulseAudio virtual sink** — a pretend audio output named `spotify_capture`. Soloist sends audio there instead of to speakers.
-4. **`spotify_recorder.py`** — FFmpeg continuously records the sink to one FLAC file. When Soloist reports a complete, uninterrupted track, the script cuts that section into its own FLAC and adds metadata, artwork, and lyrics.
+4. **`spotify_recorder.py`** — One FFmpeg process continuously records the sink into approximately 30-second FLAC chunks, without restarting the audio input between chunks. When Soloist reports a complete, uninterrupted track, the script cuts that section into its own FLAC and adds metadata, artwork, and lyrics.
 
 The phone is only the remote control. The Pi must be the Spotify playback device, otherwise there is no audio for the recorder to capture.
 
-The recorder keeps the original continuous recording. This is deliberate: track-change events and audio samples do not arrive at exactly the same instant. If a split is slightly early or late, you can export the saved session again with a different offset without recording the music again.
+The recorder keeps the original recording chunks. This is deliberate: track-change events and audio samples do not arrive at exactly the same instant. If a split is slightly early or late, you can export the saved session again with a different offset without recording the music again.
 
 ## What you will need
 
@@ -231,13 +233,13 @@ Turn off Spotify **Crossfade**, **Automix**, **Repeat**, and **Autoplay** for cl
 
 ### Background export while recording
 
-Background export is enabled by default. Use the same recording command as before; no extra flag is needed. After a complete track ends, the recorder allows five seconds for audio buffers to reach the file, then a single background worker exports it while capture continues. Encoding and artwork/lyrics requests can add more delay.
+Background export is enabled by default. Use the same recording command as before; no extra flag is needed. After a complete track ends, the recorder waits for the chunk containing its end to close (normally up to about 30 seconds of additional captured audio), then a single background worker exports it while capture continues. Encoding and artwork/lyrics requests can add more delay.
 
 `Ready to export` means the track is eligible. `Saved ARTIST - TITLE` means its finished FLAC is available in `~/spotify-recordings/tracks/` and can be copied while the next song records. Files are checked for duration and metadata and only moved into place after validation. A partial read of the growing recording is not published; failed or pending tracks are retried when recording stops. Existing valid exports are skipped.
 
-The continuous session remains available for recovery. `live-export-report.json` describes the most recent background batch, not the whole session. The final `export-report.json` covers all segments; tracks already saved in the background appear as skipped in that final report.
+All original chunks remain available for recovery. `live-export-report.json` describes the most recent background batch, not the whole session. The final `export-report.json` covers all segments; tracks already saved in the background appear as skipped in that final report.
 
-On long sessions, background export can take longer because the unfinished FLAC must be decoded from its beginning to reach the requested song. There is only one background batch at a time. If your Pi struggles with simultaneous capture and encoding, add `--no-live-export` to return to exporting only after recording stops.
+Each export reads only the chunks overlapping that song. It decodes at most approximately one extra chunk before the song, regardless of whether the playlist has been running for minutes or days. There is one worker and only one song submitted at a time. This replaces the older implementation that repeatedly decoded from the beginning of a growing `session.flac` and became progressively slower. If your Pi struggles with simultaneous capture and encoding, add `--no-live-export` to export only after recording stops.
 
 Do not run a separate manual export against the active session. Stop the recorder normally before using the `export` command.
 
@@ -272,9 +274,11 @@ With the commands in this guide, the output is `/home/pi/spotify-recordings`, al
 ```text
 ~/spotify-recordings/
 ├── metadata.json                 # local catalog of observed tracks
+├── recorder.log                  # rotating capture/export logs
 ├── tracks/                       # finished, tagged FLAC files
 └── sessions/SESSION_DIRECTORY/
-    ├── session.flac              # continuous recording of the whole run
+    ├── chunks.csv                # timestamps for finalized audio chunks
+    ├── chunks/                   # chunk-000000000.flac, chunk-000000001.flac, ...
     ├── events.jsonl              # raw Soloist playback events
     ├── session.json               # detected segments and metadata
     ├── export-report.json         # saved/skipped/incomplete/failed counts
@@ -288,11 +292,11 @@ Messages mean:
 - **`Ready to export: TITLE (track changed)`** — the previous play looked complete.
 - **`Saved ARTIST - TITLE`** — a tagged FLAC was written to `tracks/`.
 - **`Skipped existing ...`** — a valid export already exists, preventing duplicates.
-- **`Kept in session only: TITLE (paused)`** — questionable audio remains in `session.flac` but was not split.
+- **`Kept in session only: TITLE (paused)`** — questionable audio remains in the retained session audio but was not split.
 - **`buffering`** — Spotify temporarily stopped supplying audio. Short buffering is tolerated; prolonged buffering makes the segment incomplete.
 - **`seek/restart or timing discontinuity`** — playback jumped, restarted, or moved devices.
 
-An export report such as `{'saved': 2, 'skipped': 0, 'incomplete': 1, 'failed': 0}` means one section was deliberately not labeled a complete standalone song. Its audio may still be in `session.flac`.
+An export report such as `{'saved': 2, 'skipped': 0, 'incomplete': 1, 'failed': 0}` means one section was deliberately not labeled a complete standalone song. Its audio may still be in the retained session audio.
 
 ## 10. Metadata, artwork, and lyrics
 
@@ -406,7 +410,7 @@ python spotify_recorder.py export \
 
 ### I interrupted a song
 
-The final section remains in `session.flac` but is normally marked incomplete. Start a new session and replay it from the beginning.
+The final section remains in the retained session audio but is normally marked incomplete. Start a new session and replay it from the beginning.
 
 ### I started two recorders
 
@@ -432,7 +436,25 @@ You still need to recreate the `spotify_capture` null sink after boot unless you
 - Crossfade, seeking, pausing, device changes, and long buffering can make a segment incomplete.
 - `--playlist` filters observed playback context; it is not a playlist downloader.
 - Lyrics and artwork depend on external network services and may be unavailable.
-- The continuous session is retained and can consume substantial storage.
+- The session chunks are retained and can consume substantial storage. Capture refuses to start or stops when free space falls below 512 MiB by default (`--min-free-mb` can change this). Exports also check available space. These checks do not reserve disk space or delete files; other programs can still fill the disk.
+
+## Recovery, logs, and old recordings
+
+Old sessions containing `session.flac` are still supported by the `export` command. New sessions use schema 2 and contain `chunks.csv` plus a `chunks/` directory. Keep both together with `session.json` and `events.jsonl`. There is no need to convert old recordings or re-record playlists.
+
+After a crash, the new exporter can read finalized chunks listed in `chunks.csv`. The last open/unlisted chunk and track events not yet checkpointed may need manual recovery; this is not a promise that every interrupted song can be recovered. Incomplete tracks remain excluded. If FFmpeg fails, the recorder attempts to salvage complete tracks from closed chunks and records the failure in the logs.
+
+Recording logs are saved to `~/spotify-recordings/recorder.log`, with up to three rotated backups of 5 MiB each. Manual exports write `recorder.log` inside the selected session. These files work even when `journalctl --user` has no saved entries. For current capture and background-export messages:
+
+```bash
+tail -n 40 -f ~/spotify-recordings/recorder.log
+```
+
+Press Ctrl+C to exit this viewer; it does not stop the service. Once a minute, capture reports the last observed playback state, the pending segment count, and whether its worker is busy. An `Exporting` message begins a track export; `Saved` confirms a completed local file. A NAS transfer is a separate step.
+
+Stopping capture first finalizes its chunk and saves the session manifest, then waits for at most the one currently submitted background song, then runs the final retry pass. That pass may still take time if there are many songs, but no hidden background batch rereads the entire long recording. Each audio export has a timeout based on the song duration, not the session age.
+
+Artwork retry delays are capped. Missing lyrics and Spotify API token failures are logged without aborting the export. A failure downloading required artwork still leaves the track pending for retry; the source audio is kept. Existing valid files are skipped before optional API enrichment, reducing redundant requests. This update does not automatically add missing lyrics to previously saved files; `--replace` re-exports them when those services are available.
 
 ## Development check
 
@@ -442,7 +464,15 @@ Syntax-check the script without starting Spotify:
 python -m py_compile spotify_recorder.py
 ```
 
-The Raspberry Pi audio path and Soloist pairing require a live Pi test. Successful track IDs are skipped on later exports unless `--replace` is supplied.
+Run the offline regression suite from the project directory:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+It requires FFmpeg and the normal requirements, but no Spotify or NAS access. Tests cover exact decoded samples across chunk boundaries, a late-song export from a generated one-hour session without access to earlier audio chunks, live capture/export overlap, missing chunks, partial index writes, old session exports, duplicate skips, output locks, metadata network failures, low disk space, and shutdown ordering during a metadata outage. These development-machine checks do not replace a live Raspberry Pi audio/performance test.
+
+The chunk index and joining use FFmpeg's [segment muxer and concat demuxer](https://ffmpeg.org/ffmpeg-formats.html). The recorded event-to-audio offset remains approximate; chunking fixes the export performance problem, not Spotify event timing.
 
 
 ## Updating an existing Pi installation
@@ -460,3 +490,58 @@ mv spotify_recorder.py.new spotify_recorder.py
 ```
 
 Run each command only if the previous command succeeds. No new Python dependencies are required. Restart the recorder with your usual command or service. Completed songs will now export in the background.
+
+
+## Existing ZimaOS NAS upload setup
+
+In the configured Pi setup, `spotify-sync.timer` runs `sync-to-zima.sh` approximately every two minutes and copies completed FLACs from `~/spotify-recordings/tracks/` to `/mnt/zima-spotify/`. The recorder does not send audio to the NAS itself. Keep the sync script's mount check and hidden-file exclusion: the recorder writes `.pending.flac` files before atomically publishing the finished track. Chunk files are under `sessions/`, outside the upload source.
+
+Use `rsync -a` without `--checksum` for routine sync. The former checksum scan reread files across the NAS mount and stalled on this setup. Normal rsync compares size and modification time. Successful exit means the sync run completed, not that every recorded song was eligible for export. The timer does not run overlapping copies.
+
+```bash
+systemctl --user status spotify-sync.service --no-pager -l
+systemctl --user list-timers spotify-sync.timer --no-pager
+```
+
+`inactive (dead)` with `status=0/SUCCESS` is normal between runs. If a NAS connection fails, keep the local files and retry sync after the mount is available. Do not reboot a Pi that is exporting just to restart NAS sync.
+
+For a recorder run as a user service, retain the shutdown override already installed on this Pi:
+
+```ini
+[Service]
+KillMode=mixed
+TimeoutStopSec=infinity
+```
+
+It lets Python stop its own capture process and finish exporting. The NAS timer runs separately. A service configured with `Restart=always` starts a fresh waiting session after an automatic idle stop; an explicit `systemctl --user stop spotify-recorder.service` keeps it stopped. Do not interpret a new capture PID as evidence an old playlist is still exporting.
+
+
+## Upgrading to 2.0.0 while recovering an old playlist
+
+Let any manual recovery export finish first. Wait for `Export complete` and a returned prompt. Do not interrupt a successful recovery just to install this update. The old source sessions remain usable with the new exporter.
+
+If the recorder service is still running, stop it using the previously configured graceful shutdown settings and wait for the prompt:
+
+```bash
+systemctl --user stop spotify-recorder.service
+```
+
+Then install with error checks (each `&&` prevents continuing if a step fails):
+
+```bash
+cd ~/spotify-recorder &&
+cp spotify_recorder.py spotify_recorder.py.bak &&
+curl -fL https://raw.githubusercontent.com/ajshaw0327-sketch/spotify-recorder/main/spotify_recorder.py -o spotify_recorder.py.new &&
+.venv/bin/python -m py_compile spotify_recorder.py.new &&
+mv spotify_recorder.py.new spotify_recorder.py &&
+.venv/bin/python spotify_recorder.py --version
+```
+
+Expect `spotify-recorder 2.0.0`. No new Python packages are required. Restart only after successful installation:
+
+```bash
+systemctl --user start spotify-recorder.service
+systemctl --user status spotify-recorder.service --no-pager -l
+```
+
+Play a previously unsaved song from its beginning and let the next song play. Allow a chunk to close plus encoding/metadata time, then look for `Saved` in `~/spotify-recordings/recorder.log`. The existing NAS timer can upload it on a subsequent sync run. A successful local export is not itself proof of NAS delivery.
