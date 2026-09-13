@@ -10,6 +10,9 @@ See README.md for setup, audio routing, and limitations.
 from __future__ import annotations
 
 import argparse
+import csv
+from bisect import bisect_right
+from logging.handlers import RotatingFileHandler
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from contextlib import contextmanager
@@ -23,6 +26,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -34,6 +38,7 @@ import websocket
 from mutagen import MutagenError
 from mutagen.flac import FLAC, Picture
 
+VERSION = "2.0.0"
 LOG = logging.getLogger("spotify-recorder")
 
 
@@ -65,10 +70,10 @@ class SpotifyEnricher:
         return self.token
 
     def enrich(self, track):
-        token = self._access_token()
-        if not token:
-            return track
         try:
+            token = self._access_token()
+            if not token:
+                return track
             headers = {"Authorization": f"Bearer {token}"}
             response = self.http.get(
                 f"https://api.spotify.com/v1/tracks/{track['id']}",
@@ -115,7 +120,7 @@ class SpotifyEnricher:
                 if album_data.get("label"):
                     enriched["label"] = album_data["label"]
             return enriched
-        except (requests.RequestException, KeyError, TypeError, ValueError) as exc:
+        except (requests.RequestException, KeyError, TypeError, ValueError, AttributeError) as exc:
             LOG.warning("Spotify Web API enrichment failed for %s: %s", track.get("title"), exc)
             return track
 
@@ -337,6 +342,99 @@ def stop_capture(process):
     return process.returncode
 
 
+
+CHUNK_SECONDS = 30
+
+
+def chunk_output_args(session, seconds=CHUNK_SECONDS):
+    """One continuous encoder; the segment muxer closes FLACs independently."""
+    return ["-f", "segment", "-segment_format", "flac",
+            "-segment_time", str(seconds), "-reset_timestamps", "1",
+            "-segment_list", str(session / "chunks.csv"),
+            "-segment_list_type", "csv", "-segment_list_size", "0",
+            str(session / "chunks" / "chunk-%09d.flac")]
+
+
+class ChunkIndex:
+    """Incrementally read only completed CSV entries emitted by FFmpeg.
+
+    A chunk is listed only after its trailer is written. Never read the open
+    last chunk; after a crash the unlisted tail is retained for manual recovery.
+    """
+    def __init__(self, session):
+        self.session = Path(session)
+        self.offset = 0
+        self.rows = []
+        self.ends = []
+
+    def refresh(self):
+        try:
+            with (self.session / "chunks.csv").open("rb") as stream:
+                stream.seek(self.offset)
+                while True:
+                    line = stream.readline()
+                    if not line or not line.endswith(b"\n"):
+                        break
+                    name, begin, end = next(csv.reader([line.decode("utf-8")]))
+                    begin, end = float(begin), float(end)
+                    name = Path(name).name
+                    if (not re.fullmatch(r"chunk-[0-9]{9}\.flac", name)
+                            or not all(math.isfinite(v) for v in (begin, end))
+                            or begin < 0 or end < begin
+                            or (self.ends and begin < self.ends[-1] - 0.00001)):
+                        raise ValueError(f"Invalid chunk index entry: {name}, {begin}, {end}")
+                    if end == begin:
+                        self.offset = stream.tell()
+                        continue  # FFmpeg can list an empty final trailer chunk.
+                    self.rows.append((name, begin, end))
+                    self.ends.append(end)
+                    self.offset = stream.tell()
+        except FileNotFoundError:
+            pass
+        return self
+
+    def interval(self, start, duration):
+        end = start + duration
+        selected = []
+        cursor = start
+        for i in range(bisect_right(self.ends, start), len(self.rows)):
+            row = self.rows[i]
+            name, begin, finish = row
+            if begin > cursor + 0.00001:
+                return []  # Never join across a missing interval.
+            selected.append(row)
+            cursor = finish
+            if cursor >= end - 0.00001:
+                return selected
+        return []
+
+
+@contextmanager
+def chunk_input(session, index, start, duration):
+    rows = index.interval(start, duration)
+    if not rows:
+        raise RuntimeError("Audio interval is not covered by closed chunks")
+    # Place the list beside the chunks. Fixed generated basenames need no
+    # escaping and allow concat's default safe-path checks to remain enabled.
+    fd, name = tempfile.mkstemp(prefix=".export-", suffix=".ffconcat", dir=session / "chunks")
+    listing = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            out.write("ffconcat version 1.0\n")
+            for filename, begin, end in rows:
+                out.write(f"file {filename}\nduration {end - begin:.9f}\n")
+        # Output-side seek decodes at most one chunk before the requested start.
+        yield ["-f", "concat", "-safe", "1", "-i", str(listing),
+               "-ss", f"{start - rows[0][1]:.9f}"]
+    finally:
+        listing.unlink(missing_ok=True)
+
+
+@contextmanager
+def legacy_input(audio_path, start):
+    yield ["-ss", f"{start:.6f}", "-i", str(audio_path)]
+
+
 def record(args):
     root = args.output.expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -345,18 +443,23 @@ def record(args):
         session = root / "sessions" / name
         session.mkdir(parents=True)
         tracker = Tracker(args.playlist)
-        manifest = {"schema": 1, "output_root": str(root), "source": args.source,
-                    "playlist": args.playlist, "audio": "session.flac", "segments": []}
+        manifest = {"schema": 2, "recorder_version": VERSION, "output_root": str(root), "source": args.source,
+                    "playlist": args.playlist, "audio": "chunks.csv",
+                    "chunk_seconds": CHUNK_SECONDS, "segments": []}
+        (session / "chunks").mkdir()
+        chunks = ChunkIndex(session)
         save_json(session / "session.json", manifest)
         command = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-n",
                    "-f", "pulse", "-sample_rate", "44100", "-channels", "2",
                    "-fragment_size", "4096", "-i", args.source,
-                   "-map", "0:a:0", "-c:a", "flac", "-compression_level", "0",
-                   "-threads", "1", "-flush_packets", "1", str(session / "session.flac")]
+                   "-map", "0:a:0", "-af", "asettb=1/44100,asetpts=N", "-c:a", "flac", "-compression_level", "0",
+                   "-threads", "1", *chunk_output_args(session)]
         sock = None
         catalog = load_json(root / "metadata.json", {})
         if not isinstance(catalog, dict):
             raise RuntimeError("metadata.json must contain an object")
+        if shutil.disk_usage(root).free < args.min_free_mb * 1024 * 1024:
+            raise RuntimeError("Insufficient free disk space to start recording")
         with (session / "capture.log").open("wb") as capture_log, (session / "events.jsonl").open("a", encoding="utf-8") as events:
             start = time.monotonic()
             manifest["started_at"] = time.time()
@@ -365,6 +468,9 @@ def record(args):
             next_request, next_connect, backoff, saved_segments = 0.0, 0.0, 1.0, 0
             worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="flac-export")
             pending_export, submitted_segments = None, 0
+            last_playback_status = "unknown"
+            last_status = start
+            last_disk_check = start
             seen_playing, idle_since, paused_since = False, None, None
             last_persist = start
             LOG.info("Recording to %s. Start playlist playback now; Ctrl+C stops and exports.", session)
@@ -373,6 +479,56 @@ def record(args):
                     now = time.monotonic()
                     elapsed = now - start
                     if args.seconds and elapsed >= args.seconds:
+                        break
+                    # One in-flight batch, no unbounded queue. Copy metadata so the
+                    # capture thread never shares mutable state with the exporter.
+                    if pending_export is not None and pending_export.done():
+                        try:
+                            pending_export.result()
+                        except Exception:
+                            LOG.exception("Background export failed; will retry after capture stops")
+                        pending_export = None
+                    if not args.no_live_export and pending_export is None:
+                        chunks.refresh()
+                        while submitted_segments < len(tracker.segments):
+                            segment = tracker.segments[submitted_segments]
+                            if not segment["complete"]:
+                                submitted_segments += 1
+                                continue
+                            if not chunks.ends or chunks.ends[-1] < segment["start"] + segment["track"]["duration_ms"] / 1000:
+                                break  # Wait until the needed chunk is finalized.
+                            snapshot = deepcopy(dict(manifest, segments=[segment]))
+                            selected_index = ChunkIndex(session)
+                            selected_index.rows = chunks.interval(segment["start"], segment["track"]["duration_ms"] / 1000)
+                            selected_index.ends = [row[2] for row in selected_index.rows]
+                            LOG.info("Background export queued: %s", segment["track"]["title"])
+                            pending_export = worker.submit(
+                                export, session, lyrics_source=args.lyrics,
+                                live_manifest=snapshot, chunk_index=selected_index)
+                            submitted_segments += 1
+                            break  # One song at a time, including at shutdown.
+                    if time.monotonic() - last_status >= 60:
+                        LOG.info("Capturing: %.0fs; playback %s; %d segments awaiting background export; worker %s",
+                                 time.monotonic() - start, last_playback_status, len(tracker.segments) - submitted_segments,
+                                 "busy" if pending_export is not None else "idle")
+                        last_status = time.monotonic()
+                    if len(tracker.segments) != saved_segments or time.monotonic() - last_persist >= 5:
+                        catalog.update(tracker.catalog)
+                        if catalog != load_json(root / "metadata.json", {}):
+                            save_json(root / "metadata.json", catalog)
+                        manifest["segments"] = tracker.segments
+                        save_json(session / "session.json", manifest)
+                        events.flush()
+                        os.fsync(events.fileno())
+                        saved_segments, last_persist = len(tracker.segments), time.monotonic()
+                    if time.monotonic() - last_disk_check >= 5:
+                        if shutil.disk_usage(root).free < args.min_free_mb * 1024 * 1024:
+                            LOG.error("Low disk space; stopping capture to preserve existing audio")
+                            break
+                        last_disk_check = time.monotonic()
+                    if ((idle_since is not None and elapsed - idle_since >= args.idle_grace)
+                            or (paused_since is not None and elapsed - paused_since >= args.idle_grace)):
+                        LOG.info("Playback stayed idle/paused for %.0fs; stopping", args.idle_grace)
                         break
                     if sock is None:
                         if now < next_connect:
@@ -385,6 +541,7 @@ def record(args):
                             LOG.info("Connected to Soloist metadata")
                         except (OSError, websocket.WebSocketException) as exc:
                             tracker.close(elapsed, "metadata disconnected")
+                            last_playback_status = "metadata disconnected"
                             LOG.warning("Metadata unavailable: %s; capture continues", exc)
                             next_connect, backoff = now + backoff, min(30, backoff * 2)
                             continue
@@ -404,12 +561,14 @@ def record(args):
                         kind = event.get("type")
                         if kind == "playback_state":
                             status = event.get("status")
+                            last_playback_status = str(status)
                             if status == "playing":
                                 seen_playing, idle_since, paused_since = True, None, None
-                            elif status == "idle" and args.stop_when_idle and seen_playing:
-                                idle_since = idle_since or elapsed
-                            elif status == "paused" and args.stop_after_paused and seen_playing:
-                                paused_since = paused_since or elapsed
+                            else:
+                                idle_since = ((elapsed if idle_since is None else idle_since)
+                                              if status == "idle" and args.stop_when_idle and seen_playing else None)
+                                paused_since = ((elapsed if paused_since is None else paused_since)
+                                                if status == "paused" and args.stop_after_paused and seen_playing else None)
                             tracker.observe(event, elapsed, wall)
                         elif kind == "track_changed":
                             item = event.get("item") or {}
@@ -418,12 +577,14 @@ def record(args):
                             next_request = 0.0
                         elif kind == "playback_changed":
                             status = event.get("status")
+                            last_playback_status = str(status)
                             if status == "playing":
                                 seen_playing, idle_since, paused_since = True, None, None
-                            elif status == "idle" and args.stop_when_idle and seen_playing:
-                                idle_since = idle_since or elapsed
-                            elif status == "paused" and args.stop_after_paused and seen_playing:
-                                paused_since = paused_since or elapsed
+                            else:
+                                idle_since = ((elapsed if idle_since is None else idle_since)
+                                              if status == "idle" and args.stop_when_idle and seen_playing else None)
+                                paused_since = ((elapsed if paused_since is None else paused_since)
+                                                if status == "paused" and args.stop_after_paused and seen_playing else None)
                             if status == "buffering" and tracker.current:
                                 if tracker.buffering_since is None:
                                     tracker.buffering_since = elapsed
@@ -450,54 +611,17 @@ def record(args):
                                 elif speed <= 0 or abs(estimated_start - tracker.current["start"]) > 1.0:
                                     tracker.close(elapsed, "position anchor changed (seek/restart)")
                             next_request = 0.0
-                        if (args.stop_when_idle and seen_playing and idle_since is not None
-                                and elapsed - idle_since >= args.idle_grace):
-                            LOG.info("Soloist has been idle for %.0fs; stopping automatically", args.idle_grace)
-                            break
-                        if (args.stop_after_paused and seen_playing and paused_since is not None
-                                and elapsed - paused_since >= args.idle_grace):
-                            LOG.info("Soloist has been paused for %.0fs; stopping automatically", args.idle_grace)
-                            break
                     except websocket.WebSocketTimeoutException:
                         pass
                     except (OSError, websocket.WebSocketException, ValueError) as exc:
                         tracker.close(time.monotonic() - start, "metadata connection/error")
+                        last_playback_status = "metadata disconnected"
                         LOG.warning("Metadata interrupted: %s; capture continues", exc)
                         if sock:
                             sock.close()
+                        idle_since, paused_since = None, None
                         sock, next_connect = None, time.monotonic() + backoff
                         backoff = min(30, backoff * 2)
-                    # One in-flight batch, no unbounded queue. Copy metadata so the
-                    # capture thread never shares mutable state with the exporter.
-                    if pending_export is not None and pending_export.done():
-                        try:
-                            pending_export.result()
-                        except Exception:
-                            LOG.exception("Background export failed; will retry after capture stops")
-                        pending_export = None
-                    if not args.no_live_export and pending_export is None:
-                        ready = submitted_segments
-                        for segment in tracker.segments[submitted_segments:]:
-                            end = segment["start"] + segment["track"]["duration_ms"] / 1000
-                            if segment["complete"] and time.monotonic() - start < end + 5:
-                                break  # Allow capture buffers to reach the file.
-                            ready += 1
-                        batch = tracker.segments[submitted_segments:ready]
-                        if any(segment["complete"] for segment in batch):
-                            snapshot = deepcopy(dict(manifest, segments=batch))
-                            pending_export = worker.submit(
-                                export, session, lyrics_source=args.lyrics,
-                                live_manifest=snapshot)
-                        submitted_segments = ready
-                    if len(tracker.segments) != saved_segments or time.monotonic() - last_persist >= 5:
-                        catalog.update(tracker.catalog)
-                        if catalog != load_json(root / "metadata.json", {}):
-                            save_json(root / "metadata.json", catalog)
-                        manifest["segments"] = tracker.segments
-                        save_json(session / "session.json", manifest)
-                        events.flush()
-                        os.fsync(events.fileno())
-                        saved_segments, last_persist = len(tracker.segments), time.monotonic()
             except KeyboardInterrupt:
                 LOG.info("Stopping recording")
             finally:
@@ -505,16 +629,24 @@ def record(args):
                 if sock:
                     sock.close()
                 status = stop_capture(process)
-                LOG.info("Waiting for any background export to finish")
-                worker.shutdown(wait=True)
-                manifest.update(segments=tracker.segments, capture_returncode=status, stopped_at=time.time())
-                save_json(session / "session.json", manifest)
-                catalog.update(tracker.catalog)
-                save_json(root / "metadata.json", catalog)
+                try:
+                    manifest.update(segments=tracker.segments, capture_returncode=status, stopped_at=time.time())
+                    save_json(session / "session.json", manifest)
+                    catalog.update(tracker.catalog)
+                    save_json(root / "metadata.json", catalog)
+                finally:
+                    LOG.info("Capture stopped; waiting for the current background song, then retrying remaining exports")
+                    worker.shutdown(wait=True)
+                if pending_export is not None:
+                    try:
+                        pending_export.result()
+                    except Exception:
+                        LOG.exception("Background export failed; final export will retry")
         LOG.info("Session retained: %s", session)
         if status != 0:
-            raise RuntimeError(f"FFmpeg capture failed (exit {status}); inspect {session / 'capture.log'}")
-        return export(session, offset_ms=0, lyrics_source=args.lyrics)
+            LOG.error("FFmpeg capture failed (exit %s); salvaging closed chunks; see %s", status, session / "capture.log")
+        result = export(session, offset_ms=0, lyrics_source=args.lyrics)
+        return result if status == 0 else 1
 
 
 def get_artwork(track, root, http):
@@ -549,7 +681,7 @@ def get_artwork(track, root, http):
                     except ValueError:
                         pass
                 LOG.warning("Artwork download interrupted; retrying in %.1fs", delay)
-                time.sleep(delay)
+                time.sleep(min(30, max(0, delay)))
     mime = "image/jpeg" if data.startswith(b"\xff\xd8\xff") else "image/png" if data.startswith(b"\x89PNG\r\n\x1a\n") else None
     if not mime:
         raise RuntimeError("Unsupported/missing artwork image")
@@ -583,6 +715,8 @@ def get_lyrics(track, http, source):
             return None
         response.raise_for_status()
         payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("Lyrics response was not an object")
         synced = payload.get("syncedLyrics")
         plain = payload.get("plainLyrics")
         if not isinstance(synced, str):
@@ -609,10 +743,10 @@ def valid_final(path, track):
         return False
 
 
-def export(session, offset_ms=0, replace=False, lyrics_source="lrclib", live_manifest=None):
+def export(session, offset_ms=0, replace=False, lyrics_source="lrclib", live_manifest=None, chunk_index=None):
     session = Path(session).expanduser().resolve()
     manifest = live_manifest if live_manifest is not None else load_json(session / "session.json")
-    if not manifest or manifest.get("schema") != 1:
+    if not manifest or manifest.get("schema") not in (1, 2):
         raise RuntimeError("Missing or incompatible session.json")
     root = Path(manifest["output_root"])
     audio_path = session / manifest["audio"]
@@ -620,23 +754,24 @@ def export(session, offset_ms=0, replace=False, lyrics_source="lrclib", live_man
     output.mkdir(parents=True, exist_ok=True)
     with locked(root / ".export.lock"), requests.Session() as http:
         spotify = SpotifyEnricher(http)
-        # An open FLAC has no finalized duration header. During live export,
-        # decode only the requested interval and validate its actual duration
-        # before publishing. Short/partial reads are retried on final export.
-        recorded_duration = float("inf")
-        if live_manifest is None:
+        chunks = None
+        if manifest["schema"] == 2:
+            chunks = chunk_index if chunk_index is not None else ChunkIndex(session).refresh()
+            recorded_duration = chunks.ends[-1] if chunks.ends else 0
+        else:
+            if live_manifest is not None:
+                raise RuntimeError("Legacy sessions must finish capture before export")
             probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(audio_path)],
                                    capture_output=True, text=True, check=True, timeout=30)
             recorded_duration = float(json.loads(probe.stdout)["format"]["duration"])
         counts = {"saved": 0, "skipped": 0, "incomplete": 0, "failed": 0}
         failures = []
-        overrides = artwork_overrides(session / "events.jsonl")
+        overrides = artwork_overrides(session / "events.jsonl") if live_manifest is None else {}
         for segment in manifest["segments"]:
             if not segment["complete"]:
                 counts["incomplete"] += 1
                 continue
             track = segment["track"]
-            track = spotify.enrich(track)
             if overrides.get(track["id"]):
                 track = dict(track, artwork_url=overrides[track["id"]])
             final = output / f"{track['id']}.flac"
@@ -650,18 +785,24 @@ def export(session, offset_ms=0, replace=False, lyrics_source="lrclib", live_man
                 continue
             temporary = output / f".{track['id']}.pending.flac"
             try:
+                # Upper bound for stereo 32-bit PCM plus metadata overhead.
+                # Keep the source; never delete recordings to make room.
+                required = int(duration * 44100 * 2 * 4) + 8 * 1024 * 1024
+                if shutil.disk_usage(output).free < required:
+                    raise RuntimeError("Insufficient free disk space to export this track")
+                track = spotify.enrich(track)
+                LOG.info("Exporting %s - %s", track["artist"], track["title"])
                 cover = get_artwork(track, root, http)
                 lyrics = get_lyrics(track, http, lyrics_source)
-                # Open FLAC files lack the final seek metadata; decode forward
-                # to the interval instead of relying on input seeking.
-                seek_input = (["-i", str(audio_path), "-ss", f"{start:.6f}"]
-                              if live_manifest is not None else
-                              ["-ss", f"{start:.6f}", "-i", str(audio_path)])
-                command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
-                           "-threads", "1", *seek_input,
-                           "-t", f"{duration:.6f}", "-map", "0:a:0", "-vn", "-map_metadata", "-1",
-                           "-c:a", "flac", "-compression_level", "5", "-threads", "1", str(temporary)]
-                result = subprocess.run(command, capture_output=True, text=True, timeout=max(120, duration * 3 + (start if live_manifest is not None else 0)))
+                source = (chunk_input(session, chunks, start, duration) if chunks is not None
+                          else legacy_input(audio_path, start))
+                with source as seek_input:
+                    command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+                               "-threads", "1", *seek_input,
+                               "-t", f"{duration:.6f}", "-map", "0:a:0", "-vn", "-map_metadata", "-1",
+                               "-c:a", "flac", "-compression_level", "5", "-threads", "1", str(temporary)]
+                    result = subprocess.run(command, capture_output=True, text=True,
+                                            timeout=max(120, duration * 3))
                 if result.returncode:
                     raise RuntimeError(f"FFmpeg export failed: {result.stderr[-1000:]}")
                 tagged = FLAC(temporary)
@@ -720,7 +861,7 @@ def export(session, offset_ms=0, replace=False, lyrics_source="lrclib", live_man
         report_name = "live-export-report.json" if live_manifest is not None else "export-report.json"
         save_json(session / report_name, {"counts": counts, "failures": failures,
                                                     "offset_ms": offset_ms, "lyrics_source": lyrics_source})
-        LOG.info("%s: %s; continuous recording retained",
+        LOG.info("%s: %s; session audio retained",
                  "Background export batch complete" if live_manifest is not None else "Export complete", counts)
         return 2 if counts["failed"] or counts["incomplete"] or not (counts["saved"] + counts["skipped"]) else 0
 
@@ -731,10 +872,13 @@ def stop_signal(signum, frame):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--version", action="version", version=f"spotify-recorder {VERSION}")
     commands = parser.add_subparsers(dest="command", required=True)
     capture = commands.add_parser("record", help="Capture with background export and a final retry on stop")
     capture.add_argument("--no-live-export", action="store_true",
                          help="Export only after capture stops (background export is enabled by default)")
+    capture.add_argument("--min-free-mb", type=int, default=512,
+                         help="Stop capture below this much free disk space (MiB; default: 512)")
     capture.add_argument("--source", required=True, help="Explicit monitor source, e.g. spotify_capture.monitor")
     capture.add_argument("--output", type=Path, default=Path("recordings"))
     capture.add_argument("--websocket", default="ws://127.0.0.1:9090")
@@ -756,6 +900,8 @@ def main():
                        help="Lyrics metadata source (default: LRCLIB; use off to skip lookup)")
     args = parser.parse_args()
     if args.command == "record":
+        if args.min_free_mb < 64:
+            parser.error("--min-free-mb must be at least 64")
         if args.playlist and not re.fullmatch(r"[A-Za-z0-9]{22}", args.playlist):
             parser.error("--playlist requires a 22-character Spotify playlist ID")
         if args.seconds is not None and (not math.isfinite(args.seconds) or args.seconds <= 0):
@@ -767,7 +913,20 @@ def main():
     elif not math.isfinite(args.offset_ms):
         parser.error("--offset-ms must be finite")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    return record(args) if args.command == "record" else export(args.session, args.offset_ms, args.replace, args.lyrics)
+    log_root = args.output.expanduser().resolve() if args.command == "record" else args.session.expanduser().resolve()
+    log_root.mkdir(parents=True, exist_ok=True)
+    handler = RotatingFileHandler(log_root / "recorder.log", maxBytes=5 * 1024 * 1024, backupCount=3)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    LOG.addHandler(handler)
+    LOG.info("spotify-recorder %s; command=%s", VERSION, args.command)
+    try:
+        return record(args) if args.command == "record" else export(args.session, args.offset_ms, args.replace, args.lyrics)
+    except Exception:
+        LOG.exception("Recorder/export failed; session files retained")
+        raise
+    finally:
+        LOG.removeHandler(handler)
+        handler.close()
 
 
 if __name__ == "__main__":
